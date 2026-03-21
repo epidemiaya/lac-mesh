@@ -1,70 +1,65 @@
 # lac-mesh
 
 ```
-╔═══════════════════════════════════════════════════════════╗
-║  no internet. no servers. no compromise.                  ║
-║                                                           ║
-║  [phone A] ──BLE──▶ [phone B] ──BLE──▶ [phone C]         ║
-║       Ed25519 signed · TTL-routed · store-and-forward     ║
-╚═══════════════════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════════════════════╗
+║  no internet. no servers. no compromise.                      ║
+║                                                               ║
+║  [phone A — AP] ──WiFi Direct──▶ [phone B — AP+STA]          ║
+║                                        ──WiFi Direct──▶ [C]  ║
+║       Ed25519 signed · TTL-routed · store-and-forward         ║
+╚═══════════════════════════════════════════════════════════════╝
 ```
 
-**Offline BLE mesh transport layer for [LightAnonChain](https://github.com/epidemiaya/LightAnonChain-).**
+**Offline WiFi Direct mesh transport layer for [LightAnonChain](https://github.com/epidemiaya/LightAnonChain-).**
 
-Drop-in replacement for WebSocket when the internet is gone. Every packet is Ed25519-signed — the vulnerability that killed Bitchat does not exist here.
+Drop-in replacement for WebSocket when the internet is gone. Messages travel device-to-device over WiFi Direct — no towers, no routers, no cloud.
 
 [![license MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![part of LAC](https://img.shields.io/badge/part_of-LightAnonChain-purple.svg)](https://github.com/epidemiaya/LightAnonChain-)
-[![platform Android](https://img.shields.io/badge/platform-Android-green.svg)]()
+[![platform Android](https://img.shields.io/badge/platform-Android%209+-green.svg)]()
 
 ---
 
-## Why this exists
+## Why WiFi Direct, not Bluetooth
 
-When governments cut the internet, your messages stop. Signal goes dark. Telegram goes dark. Everything that relies on a central server goes dark.
+| | BLE (Bitchat) | **WiFi Direct (LAC Mesh)** |
+|---|---|---|
+| Range | 30–100m | **100–300m** |
+| Speed | ~1 Mbps | **300 Mbps+** |
+| iOS support | partial | Android-first |
+| Message size | 20–512 bytes | **unlimited** |
+| Simultaneous AP+STA | ❌ | **✅ Android 9+** |
 
-LAC Mesh doesn't.
-
-Messages travel device-to-device over Bluetooth Low Energy, hopping through anyone running the app until they reach their destination — or get stored on nearby nodes until the recipient comes back online.
-
-No towers. No routers. No cloud. No accounts. Just physics.
-
----
-
-## How it compares
-
-|                        | Bitchat | Briar | **lac-mesh**         |
-|------------------------|---------|-------|----------------------|
-| Transport              | BLE     | BLE   | **BLE + WiFi Direct*** |
-| Signature scheme       | ❌ broken | Ed25519 | **Ed25519**      |
-| Post-quantum ready     | ❌       | ❌     | **Kyber-768 compatible** |
-| Store-and-forward      | ✅      | ✅    | **✅**               |
-| Blockchain integration | ❌       | ❌     | **✅ LAC UTXO**      |
-| Open source            | ✅      | ✅    | **✅**               |
-| iOS support            | partial | partial | Android-first      |
-
-*WiFi Direct coming in v0.2*
+WiFi Direct allows a phone to be **both** an Access Point and a Station simultaneously. Phone B connects to Phone A (as client) while also hosting a hotspot for Phone C. This creates a real multi-hop mesh — no router needed.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                    LacMesh (API)                     │
-├──────────────────────┬──────────────────────────────┤
-│    MeshRouter        │       MeshCrypto              │
-│  flood routing       │  Ed25519 sign/verify          │
-│  store-and-forward   │  key import from LAC node     │
-│  TTL management      │  Kyber-768 compatible         │
-├──────────────────────┴──────────────────────────────┤
-│                  MeshDedup                           │
-│         seen{} · loop prevention · 10min TTL        │
-├─────────────────────────────────────────────────────┤
-│                  BleTransport                        │
-│    Capacitor BLE · scan · advertise · GATT notify   │
-│    mock fallback for browser/dev                     │
-└─────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────┐
+│                    LacMesh (API)                         │
+├──────────────────────┬──────────────────────────────────┤
+│    MeshRouter        │       MeshCrypto                  │
+│  flood routing       │  Ed25519 sign/verify              │
+│  store-and-forward   │  compatible with lac_crypto.py    │
+│  TTL management      │  Kyber-768 ready                  │
+├──────────────────────┴──────────────────────────────────┤
+│                  MeshDedup                               │
+│         seen{} · loop prevention · 10min TTL            │
+├─────────────────────────────────────────────────────────┤
+│              WifiDirectTransport                         │
+│  WiFi Direct AP+STA · TCP sockets · mDNS discovery      │
+│  LAN UDP fallback (same WiFi) · Mock for dev/test        │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Transport modes (auto-detected)
+
+```
+1. WIFI_DIRECT  — native Capacitor plugin, full offline mesh
+2. LAN_UDP      — same WiFi fallback, works in PWA
+3. MOCK         — dev/test, no hardware needed
 ```
 
 ### Packet format
@@ -82,68 +77,53 @@ No towers. No routers. No cloud. No accounts. Just physics.
 }
 ```
 
-Max size: **512 bytes** (BLE MTU safe). Payload is whatever LAC encrypts — `lac-mesh` is transport-only and never touches plaintext.
+Every packet is **Ed25519-signed**. Unsigned or tampered packets are dropped silently. This is the vulnerability that broke Bitchat — it does not exist here.
 
-### Routing
+---
 
-Managed flood routing with TTL (default 5 hops, max 7):
+## How it works
 
 ```
-A sends MSG(ttl=5) → B receives, delivers if for B, relays MSG(ttl=4)
-                   → C receives, delivers if for C, relays MSG(ttl=3)
-                   → D receives (ttl=2), relays further...
+Phone A (AP)                Phone B (AP+STA)              Phone C (STA)
+192.168.49.1                192.168.49.1                  client
+    │                            │                             │
+    │◄──── WiFi Direct ─────────►│◄──── WiFi Direct ──────────►│
+    │      TCP :47731             │      TCP :47731              │
+    │                            │                             │
+    └── MSG(ttl=5) ─────────────►└── MSG(ttl=4) ──────────────►└ deliver
+                                  also relay to other peers
 ```
 
-Deduplication by `msg_id` — each node remembers seen IDs for 10 minutes. No relay loops.
-
-### Store-and-forward
-
-If the recipient is known but offline, the packet is queued locally for up to **12 hours**. When the recipient reconnects to the mesh, queued packets flush automatically.
+**Store-and-forward**: if recipient is offline, nearby nodes cache the message for up to 12 hours and deliver when they reconnect.
 
 ---
 
 ## Installation
 
 ```bash
-# In your LAC mobile project:
 npm install lac-mesh
-
-# Capacitor dependencies (for native Android BLE):
-npm install @capacitor/core @capacitor-community/bluetooth-le
-npx cap sync android
 ```
 
-### Android permissions
-
-Add to `android/app/src/main/AndroidManifest.xml`:
-
-```xml
-<!-- BLE scanning -->
-<uses-permission android:name="android.permission.BLUETOOTH_SCAN"
-    android:usesPermissionFlags="neverForLocation" />
-<uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
-<uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
-
-<!-- Required for Android 9 and below -->
-<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
-
-<uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
+For native WiFi Direct (Android APK via Capacitor):
+```bash
+npm install @capacitor/core @capacitor/android
+npx cap sync android
 ```
 
 ---
 
 ## Usage
 
-### Basic — 3 lines in App.jsx
+### 3 lines in App.jsx
 
 ```js
 import { LacMesh } from 'lac-mesh'
 
 const mesh = new LacMesh({
   onMessage: (msg) => handleIncoming(msg),
-  onStatus:  (status, { peers }) => updateStatusBar(status, peers),
+  onStatus:  (status, { peers, mode }) => updateUI(status, peers),
 
-  // Reuse existing LAC keypair (no second identity):
+  // Reuse existing LAC keypair — no second identity:
   pubkeyHex: lacNode.publicKey,
   seckeyHex: lacNode.secretKey,
 })
@@ -154,54 +134,25 @@ await mesh.start()
 ### Hybrid transport (WebSocket + Mesh fallback)
 
 ```js
-// In your sendMessage() function — zero changes to lac_node.py:
-
+// sendMessage() — zero changes to lac_node.py:
 function sendMessage(msg) {
-  const payload = encryptPayload(msg)  // your existing LAC encryption
+  const payload = encryptPayload(msg)
 
   if (wsConnected) {
     ws.send(JSON.stringify({ to: msg.to, payload }))
   } else {
-    // Internet gone — fall back to mesh:
+    // Internet gone — mesh takes over:
     mesh.send({ to: msg.to, payload })
   }
 }
 ```
 
-### Full options
+### Connect by IP (LAN fallback)
 
 ```js
-const mesh = new LacMesh({
-  // Required:
-  onMessage: ({ msg_id, from, to, payload, ts, type }) => { /* ... */ },
-
-  // Optional:
-  onStatus:  (status, meta) => console.log(status, meta.peers),
-  onPeer:    ({ id, event }) => console.log(`peer ${event}: ${id}`),
-  onLog:     (msg) => console.debug(msg),
-
-  // Identity — reuse LAC keypair or leave empty to generate:
-  pubkeyHex: '...',
-  seckeyHex: '...',
-
-  // Dedup tuning:
-  dedup: {
-    ttl_ms:   10 * 60 * 1000,  // remember msg IDs for 10 min
-    max_size:  2000,            // max tracked IDs
-  },
-})
-```
-
-### Status values
-
-```js
-import { MeshStatus } from 'lac-mesh'
-
-MeshStatus.STOPPED       // not started
-MeshStatus.STARTING      // initializing BLE
-MeshStatus.IDLE          // running, no peers nearby
-MeshStatus.CONNECTED     // running, ≥1 peer in range
-MeshStatus.NO_BLUETOOTH  // BLE unavailable on this device
+// When both phones on same WiFi — connect directly by IP:
+// Phone A shows QR with its local IP → Phone B scans → connect
+mesh.connectByIp('192.168.1.42')
 ```
 
 ---
@@ -215,69 +166,43 @@ npm install
 node example/demo.js
 ```
 
-Expected output:
 ```
 ═══════════════════════════════════════
   LAC Mesh — demo (direct router test)
 ═══════════════════════════════════════
 
-Alice: a1b2c3d4e5f6a7b8c9d0e1f2...
-Bob:   f0e1d2c3b4a5968778695a4b...
+Alice: ebd118bbef513c10…
+Bob:   a382eca7367254b5…
 
-Test 1: Alice → Bob (direct message)
-─────────────────────────────────────
-📩 Bob received: payload="hello-from-alice"
+Test 1: Alice → Bob (direct)     ✓
+Test 2: Broadcast                ✓
+Test 3: Dedup (replay blocked)   ✓  delivered 1/3 attempts
+Test 4: Invalid signature        ✓  dropped
 
-Test 2: Alice broadcast to all nodes
-─────────────────────────────────────
-📩 Bob received: payload="broadcast-from-alice"
-📩 Alice received: payload="broadcast-from-alice"
-
-Test 3: Dedup — replay attack prevention
-─────────────────────────────────────────
-   Delivered: 1 time(s) (expected: 1)
-
-Test 4: Invalid signature → drop
-──────────────────────────────────
-   Delivered: 0 time(s) (expected: 0 — invalid sig dropped)
-
-═══════════════════════════════════════
-  Total delivered: 4
-  All tests passed ✓
+All tests passed ✓
 ═══════════════════════════════════════
 ```
-
----
-
-## BLE Service UUIDs
-
-LAC Mesh uses globally unique 128-bit UUIDs:
-
-```
-Service:         4c414300-0000-1000-8000-00805f9b34fb
-TX (write):      4c414301-0000-1000-8000-00805f9b34fb
-RX (notify):     4c414302-0000-1000-8000-00805f9b34fb
-```
-
-`4c4143` = `LAC` in ASCII. Unique per project — no collision with Bitchat or any other app.
 
 ---
 
 ## Roadmap
 
-- [x] v0.1 — BLE transport + flood routing + store-and-forward
-- [ ] v0.2 — WiFi Direct support (10× range, 300× speed)
-- [ ] v0.3 — Kyber-768 post-quantum handshake for session keys
-- [ ] v0.4 — Cover traffic (decoy messages to mask real activity)
-- [ ] v0.5 — USB relay bridge (device acts as mesh extender via USB)
+- [x] v0.1 — Core: MeshRouter, MeshCrypto, MeshDedup, MeshPacket
+- [x] v0.1 — WifiDirectTransport (AP+STA architecture)
+- [x] v0.1 — LAN UDP fallback mode
+- [ ] v0.2 — Native Capacitor plugin: `LacWifiDirect.java`
+- [ ] v0.2 — mDNS peer discovery
+- [ ] v0.3 — QR code peer handshake
+- [ ] v0.4 — Kyber-768 post-quantum session keys
+- [ ] v0.5 — Cover traffic (decoy messages)
 
 ---
 
 ## Part of the LAC ecosystem
 
 ```
-epidemiaya/LightAnonChain-    ← core blockchain node
-epidemiaya/lac-mesh           ← this module
+epidemiaya/LightAnonChain-    ← core blockchain + messenger
+epidemiaya/lac-mesh           ← this module (offline transport)
 epidemiaya/nagini-protocol    ← geographic secret distribution
 ```
 
@@ -285,7 +210,7 @@ epidemiaya/nagini-protocol    ← geographic secret distribution
 
 ## License
 
-MIT — use it, fork it, build on it.
+MIT
 
 ---
 

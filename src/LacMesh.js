@@ -1,9 +1,14 @@
 /**
  * LacMesh — main entry point for the LAC offline mesh transport
  *
- * Orchestrates BleTransport + MeshRouter + MeshCrypto into a single
+ * Orchestrates WifiDirectTransport + MeshRouter + MeshCrypto into a single
  * easy-to-use API. Designed to drop into any LAC client with minimal
  * changes — just 3 lines in App.jsx.
+ *
+ * Transport priority:
+ *   1. WiFi Direct AP+STA  — full offline mesh, 100-300m, 300Mbps
+ *   2. LAN UDP broadcast   — same WiFi fallback, works in PWA
+ *   3. Mock                — dev/test mode
  *
  * Usage:
  *   import { LacMesh } from 'lac-mesh'
@@ -15,39 +20,36 @@
  *
  *   await mesh.start()
  *
- *   // Send (replaces WebSocket send when offline):
- *   mesh.send({ to: recipientPubkey, text: 'hello', encrypted: base64payload })
- *
  *   // In App.jsx sendMessage():
  *   if (wsConnected) sendWS(msg)
- *   else mesh.send(msg)
+ *   else mesh.send({ to: recipientPubkey, payload: base64payload })
  */
 
-import { MeshCrypto }  from './MeshCrypto.js'
-import { MeshRouter }  from './MeshRouter.js'
-import { BleTransport } from './BleTransport.js'
-import { PacketType }   from './MeshPacket.js'
+import { MeshCrypto }          from './MeshCrypto.js'
+import { MeshRouter }          from './MeshRouter.js'
+import { WifiDirectTransport, TRANSPORT_MODE } from './WifiDirectTransport.js'
+import { PacketType }          from './MeshPacket.js'
 
-export { MeshCrypto, MeshRouter, BleTransport, PacketType }
+export { MeshCrypto, MeshRouter, WifiDirectTransport, PacketType, TRANSPORT_MODE }
 
 export const MeshStatus = Object.freeze({
   STOPPED:      'STOPPED',
   STARTING:     'STARTING',
   IDLE:         'IDLE',        // running, no peers
   CONNECTED:    'CONNECTED',   // running, ≥1 peer
-  NO_BLUETOOTH: 'NO_BLUETOOTH',
+  NO_WIFI:      'NO_WIFI',
 })
 
 export class LacMesh {
   /**
    * @param {object} opts
-   * @param {Function}     opts.onMessage     - callback({ from, to, payload, ts, msg_id })
-   * @param {Function}     [opts.onStatus]    - callback(MeshStatus, { peers: number })
-   * @param {Function}     [opts.onPeer]      - callback({ id, event: 'join'|'leave' })
-   * @param {Function}     [opts.onLog]       - debug log callback(string)
-   * @param {string}       [opts.pubkeyHex]   - existing LAC pubkey (reuse identity)
-   * @param {string}       [opts.seckeyHex]   - existing LAC seckey (reuse identity)
-   * @param {object}       [opts.dedup]       - MeshDedup options
+   * @param {Function}  opts.onMessage   - callback({ from, to, payload, ts, msg_id })
+   * @param {Function}  [opts.onStatus]  - callback(MeshStatus, { peers, mode })
+   * @param {Function}  [opts.onPeer]    - callback({ id, event: 'join'|'leave' })
+   * @param {Function}  [opts.onLog]     - debug log callback(string)
+   * @param {string}    [opts.pubkeyHex] - existing LAC pubkey (reuse identity)
+   * @param {string}    [opts.seckeyHex] - existing LAC seckey (reuse identity)
+   * @param {object}    [opts.dedup]     - MeshDedup options
    */
   constructor({
     onMessage,
@@ -63,29 +65,26 @@ export class LacMesh {
     this._onPeer    = onPeer
     this._onLog     = onLog
 
-    // Identity: use existing LAC keypair or generate fresh
+    // Identity: reuse existing LAC keypair or generate fresh
     this.crypto = (pubkeyHex && seckeyHex)
       ? MeshCrypto.fromHex(pubkeyHex, seckeyHex)
       : MeshCrypto.generate()
 
     this._log(`[LacMesh] identity: ${this.crypto.publicKeyHex.slice(0, 16)}…`)
 
-    // Peer registry: deviceId (BLE) ↔ pubkeyHex (LAC)
-    this._bleIdToPubkey = new Map()
-
-    this._transport = new BleTransport({
+    this._transport = new WifiDirectTransport({
       onPacket:    (json)     => this._router.receive(json),
-      onPeerFound: (deviceId) => this._onPeerFound(deviceId),
-      onPeerLost:  (deviceId) => this._onPeerLost(deviceId),
+      onPeerFound: (id)       => this._onPeerFound(id),
+      onPeerLost:  (id)       => this._onPeerLost(id),
       onLog:       (msg)      => this._log(msg),
     })
 
     this._router = new MeshRouter({
-      crypto:     this.crypto,
+      crypto:    this.crypto,
       dedup,
-      onDeliver:  (packet) => this._onDeliver(packet),
-      onRelay:    (packet) => this._transmit(packet),
-      onPing:     (pubkey) => this._log(`[LacMesh] ping from ${pubkey.slice(0, 16)}…`),
+      onDeliver: (packet) => this._onDeliver(packet),
+      onRelay:   (packet) => this._transmit(packet),
+      onPing:    (pubkey) => this._log(`[LacMesh] ping from ${pubkey.slice(0, 16)}…`),
     })
 
     this._status = MeshStatus.STOPPED
@@ -93,87 +92,72 @@ export class LacMesh {
 
   // ── Public API ─────────────────────────────────────────────────────────────
 
-  /**
-   * Initialize BLE and start mesh.
-   * @returns {Promise<MeshStatus>}
-   */
+  /** Initialize and start mesh transport */
   async start() {
     this._setStatus(MeshStatus.STARTING)
-    const hasBle = await this._transport.init()
-
-    if (!hasBle && !this._transport.isMock) {
-      this._setStatus(MeshStatus.NO_BLUETOOTH)
-      return MeshStatus.NO_BLUETOOTH
-    }
+    const mode = await this._transport.init()
+    this._log(`[LacMesh] transport mode: ${mode}`)
 
     await this._transport.start()
-    this._router.ping()  // announce ourselves immediately
+    this._router.ping()
     this._setStatus(MeshStatus.IDLE)
     this._log('[LacMesh] started')
-    return MeshStatus.IDLE
+    return mode
   }
 
-  /** Stop the mesh transport */
+  /** Stop mesh transport */
   async stop() {
     await this._transport.stop()
     this._setStatus(MeshStatus.STOPPED)
-    this._log('[LacMesh] stopped')
   }
 
   /**
    * Send a message over the mesh.
-   *
    * @param {object} opts
-   * @param {string}  opts.payload    - base64 encrypted payload (same as LAC WebSocket msg)
-   * @param {string}  [opts.to]       - recipient pubkey hex (null = broadcast)
-   * @param {number}  [opts.ttl]      - override default TTL
-   * @returns {string} msg_id of sent packet
+   * @param {string}  opts.payload  - base64 encrypted payload
+   * @param {string}  [opts.to]     - recipient pubkey hex (null = broadcast)
+   * @param {number}  [opts.ttl]    - override default TTL
+   * @returns {string} msg_id
    */
   send({ payload, to = null, ttl } = {}) {
     const packet = this._router.send({ payload, to, ttl })
-    this._log(`[LacMesh] sent ${packet.msg_id.slice(0, 8)}… → ${to ? to.slice(0, 8) + '…' : 'broadcast'}`)
+    this._log(`[LacMesh] sent ${packet.msg_id.slice(0, 8)}…`)
     return packet.msg_id
   }
 
+  /** Announce presence to nearby nodes */
+  ping() { this._router.ping() }
+
   /**
-   * Convenience: send a ping to announce presence to nearby nodes.
+   * Connect to peer by local IP (LAN fallback mode).
+   * Use when both devices on same WiFi — e.g. after QR scan.
+   * @param {string} ip
    */
-  ping() {
-    this._router.ping()
-  }
+  connectByIp(ip) { this._transport.connectByIp?.(ip) }
 
   /** This node's public key (hex) */
-  get pubkey() {
-    return this.crypto.publicKeyHex
-  }
+  get pubkey()     { return this.crypto.publicKeyHex }
 
   /** Current mesh status */
-  get status() {
-    return this._status
-  }
+  get status()     { return this._status }
 
-  /** Number of currently connected BLE peers */
-  get peerCount() {
-    return this._transport.connectedCount
-  }
+  /** Number of connected peers */
+  get peerCount()  { return this._transport.connectedCount }
 
-  /** Export keypair (to persist between sessions) */
-  exportIdentity() {
-    return this.crypto.toHex()
-  }
+  /** Current transport mode */
+  get mode()       { return this._transport.mode }
+
+  /** Export keypair for persistent storage */
+  exportIdentity() { return this.crypto.toHex() }
 
   // ── Private ────────────────────────────────────────────────────────────────
 
   _transmit(packet) {
-    try {
-      this._transport.broadcast(packet.serialize())
-    } catch (e) {
-      this._log(`[LacMesh] transmit error: ${e.message}`)
-    }
+    try { this._transport.broadcast(packet.serialize()) }
+    catch (e) { this._log(`[LacMesh] transmit error: ${e.message}`) }
   }
 
   _onDeliver(packet) {
-    this._log(`[LacMesh] deliver ${packet.msg_id.slice(0, 8)}… from ${packet.from.slice(0, 8)}…`)
     this._onMessage({
       msg_id:  packet.msg_id,
       from:    packet.from,
@@ -184,19 +168,16 @@ export class LacMesh {
     })
   }
 
-  _onPeerFound(deviceId) {
-    this._router.peerConnected(deviceId)
-    this._onPeer({ id: deviceId, event: 'join' })
+  _onPeerFound(id) {
+    this._router.peerConnected(id)
+    this._onPeer({ id, event: 'join' })
     this._updateStatus()
-    // Send a ping so peer learns our pubkey
     this._router.ping()
   }
 
-  _onPeerLost(deviceId) {
-    const pubkey = this._bleIdToPubkey.get(deviceId)
-    if (pubkey) this._router.peerDisconnected(pubkey)
-    this._bleIdToPubkey.delete(deviceId)
-    this._onPeer({ id: deviceId, event: 'leave' })
+  _onPeerLost(id) {
+    this._router.peerDisconnected(id)
+    this._onPeer({ id, event: 'leave' })
     this._updateStatus()
   }
 
@@ -209,10 +190,8 @@ export class LacMesh {
 
   _setStatus(s) {
     this._status = s
-    this._onStatus(s, { peers: this.peerCount })
+    this._onStatus(s, { peers: this.peerCount, mode: this._transport.mode })
   }
 
-  _log(msg) {
-    this._onLog(msg)
-  }
+  _log(msg) { this._onLog(msg) }
 }
