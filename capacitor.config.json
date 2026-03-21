@@ -1,0 +1,21 @@
+{
+  "appId": "uk.lac.mesh",
+  "appName": "LAC Mesh",
+  "webDir": "dist",
+  "bundledWebRuntime": false,
+  "plugins": {
+    "BluetoothLe": {
+      "displayStrings": {
+        "scanning": "Scanning for LAC mesh nodes...",
+        "cancel": "Cancel",
+        "availableDevices": "Nearby LAC nodes",
+        "noDeviceFound": "No LAC nodes found nearby"
+      }
+    }
+  },
+  "android": {
+    "allowMixedContent": false,
+    "captureInput": true,
+    "webContentsDebuggingEnabled": false
+  }
+}

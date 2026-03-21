@@ -1,0 +1,49 @@
+{
+  "name": "lac-mesh",
+  "version": "0.1.0",
+  "description": "Offline BLE mesh transport layer for LightAnonChain — privacy-first P2P messaging without internet",
+  "main": "src/LacMesh.js",
+  "type": "module",
+  "scripts": {
+    "test": "node --experimental-vm-modules node_modules/.bin/jest",
+    "lint": "eslint src/",
+    "example": "node example/demo.js"
+  },
+  "keywords": [
+    "mesh",
+    "ble",
+    "bluetooth",
+    "p2p",
+    "offline",
+    "privacy",
+    "lac",
+    "lightanonchain",
+    "encrypted-messaging",
+    "capacitor"
+  ],
+  "author": "epidemiaya",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/epidemiaya/lac-mesh"
+  },
+  "dependencies": {
+    "tweetnacl": "^1.0.3",
+    "tweetnacl-util": "^0.15.1",
+    "uuid": "^11.0.0"
+  },
+  "devDependencies": {
+    "jest": "^29.0.0"
+  },
+  "peerDependencies": {
+    "@capacitor/core": "^6.0.0",
+    "@capacitor-community/bluetooth-le": "^6.0.0"
+  },
+  "peerDependenciesOptional": {
+    "@capacitor/core": true,
+    "@capacitor-community/bluetooth-le": true
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
