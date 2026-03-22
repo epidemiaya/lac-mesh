@@ -10,6 +10,7 @@ import android.net.wifi.p2p.WifiP2pDevice;
 import android.net.wifi.p2p.WifiP2pManager;
 import android.net.wifi.p2p.WifiP2pManager.ActionListener;
 import android.net.wifi.p2p.WifiP2pManager.Channel;
+import android.os.Build;
 import android.os.Looper;
 import android.util.Log;
 
@@ -27,16 +28,31 @@ import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
-// v2 � TCP after group formed, groupOwnerIntent=15
+/**
+ * LacWifiDirect v3 — Multi-hop WiFi Direct mesh for LAC
+ *
+ * Supports 3+ devices via autonomous group (Android 9+):
+ *
+ *   Phone A (GO)  ←── Phone B (STA to A + autonomous GO) ←── Phone C (STA)
+ *        TCP                        TCP
+ *
+ * Each device:
+ *   1. Creates an autonomous WiFi Direct group (becomes GO/AP)
+ *   2. Simultaneously connects as STA to discovered peers
+ *   3. Relays packets to all connected peers (flood routing)
+ *
+ * Relay logic is handled by MeshRouter.js (TTL + dedup).
+ * This class is pure transport — send/receive raw JSON strings.
+ */
 public class LacWifiDirect {
 
     private static final String TAG       = "LacWifiDirect";
     public  static final int    MESH_PORT = 47731;
 
     public interface Listener {
-        void onPeerFound(String deviceAddress, String deviceName);
-        void onPeerLost(String deviceAddress);
-        void onPacketReceived(String rawJson, String fromAddress);
+        void onPeerFound(String peerId, String peerName);
+        void onPeerLost(String peerId);
+        void onPacketReceived(String rawJson, String fromId);
         void onConnected(String groupOwnerIp, boolean isGroupOwner);
         void onDisconnected();
         void onLog(String message);
@@ -48,12 +64,13 @@ public class LacWifiDirect {
     private final Channel         channel;
     private final ExecutorService executor;
 
-    private final Map<String, PeerConnection> connections    = new HashMap<>();
-    private final List<WifiP2pDevice>         discoveredPeers = new ArrayList<>();
+    private final Map<String, PeerConnection> connections     = new HashMap<>();
+    private final List<String>                connectingPeers = new ArrayList<>();
 
     private ServerSocket serverSocket;
-    private boolean      running      = false;
-    private boolean      groupFormed  = false;
+    private boolean      running     = false;
+    private boolean      groupActive = false;
+    private String       myGroupIp   = null;
 
     public LacWifiDirect(Context context, Listener listener) {
         this.context  = context;
@@ -69,8 +86,9 @@ public class LacWifiDirect {
         running = true;
         registerReceiver();
         startTcpServer();
-        discoverPeers();
-        log("LacWifiDirect started on port " + MESH_PORT);
+
+        // Step 1: create autonomous group (we become GO/AP for others)
+        createAutonomousGroup();
     }
 
     public void stop() {
@@ -82,7 +100,7 @@ public class LacWifiDirect {
         }
         manager.stopPeerDiscovery(channel, null);
         manager.removeGroup(channel, null);
-        log("LacWifiDirect stopped");
+        log("stopped");
     }
 
     public void broadcast(String rawJson) {
@@ -91,7 +109,7 @@ public class LacWifiDirect {
                 log("broadcast: no peers connected");
                 return;
             }
-            for (String key : connections.keySet()) {
+            for (String key : new ArrayList<>(connections.keySet())) {
                 sendTo(key, rawJson);
             }
         }
@@ -105,32 +123,58 @@ public class LacWifiDirect {
                 conn.writer.println(rawJson);
                 conn.writer.flush();
             } catch (Exception e) {
-                log("sendTo failed: " + e.getMessage());
+                log("sendTo failed " + peerId + ": " + e.getMessage());
                 removePeer(peerId);
             }
         });
     }
 
-    public void connectToPeer(String deviceAddress) {
-        WifiP2pConfig config = new WifiP2pConfig();
-        config.deviceAddress    = deviceAddress;
-        config.groupOwnerIntent = 15; // prefer being Group Owner so we can accept TCP
+    public int getConnectedCount() { return connections.size(); }
 
-        manager.connect(channel, config, new ActionListener() {
-            @Override public void onSuccess() { log("P2P connect initiated → " + deviceAddress); }
-            @Override public void onFailure(int r) { log("P2P connect failed → " + deviceAddress + " reason=" + r); }
+    // ── Autonomous Group (AP+STA core) ────────────────────────────────────────
+
+    /**
+     * Create a persistent WiFi Direct group.
+     * This makes us a Group Owner (AP) that others can connect to.
+     * After group is created, we start discovering and connecting to OTHER peers as STA.
+     * Result: we are simultaneously AP (accepting) and STA (connecting) = true mesh node.
+     */
+    private void createAutonomousGroup() {
+        manager.createGroup(channel, new ActionListener() {
+            @Override
+            public void onSuccess() {
+                log("autonomous group created — we are GO/AP");
+                groupActive = true;
+                // Now discover peers to connect to as STA
+                new android.os.Handler(Looper.getMainLooper())
+                    .postDelayed(() -> discoverPeers(), 1000);
+            }
+            @Override
+            public void onFailure(int reason) {
+                log("createGroup failed reason=" + reason + " — trying removeGroup first");
+                // Group might already exist — remove and retry
+                manager.removeGroup(channel, new ActionListener() {
+                    @Override public void onSuccess() {
+                        new android.os.Handler(Looper.getMainLooper())
+                            .postDelayed(() -> createAutonomousGroup(), 1000);
+                    }
+                    @Override public void onFailure(int r) {
+                        log("removeGroup also failed — starting discovery anyway");
+                        discoverPeers();
+                    }
+                });
+            }
         });
     }
-
-    public int getConnectedCount() { return connections.size(); }
 
     // ── Discovery ─────────────────────────────────────────────────────────────
 
     private void discoverPeers() {
+        if (!running) return;
         manager.discoverPeers(channel, new ActionListener() {
             @Override public void onSuccess() { log("peer discovery started"); }
             @Override public void onFailure(int r) {
-                log("peer discovery failed, reason=" + r);
+                log("peer discovery failed reason=" + r);
                 if (running) {
                     new android.os.Handler(Looper.getMainLooper())
                         .postDelayed(() -> discoverPeers(), 5000);
@@ -141,16 +185,33 @@ public class LacWifiDirect {
 
     private void requestPeerList() {
         manager.requestPeers(channel, peers -> {
-            discoveredPeers.clear();
             for (WifiP2pDevice device : peers.getDeviceList()) {
-                discoveredPeers.add(device);
-                listener.onPeerFound(device.deviceAddress, device.deviceName);
-                log("found peer: " + device.deviceName + " @ " + device.deviceAddress);
+                String addr = device.deviceAddress;
+                listener.onPeerFound(addr, device.deviceName);
+                log("found peer: " + device.deviceName + " @ " + addr);
 
-                // Initiate P2P connection — TCP will happen after group is formed
-                if (!groupFormed) {
-                    connectToPeer(device.deviceAddress);
+                // Connect as STA to this peer's group
+                // (we are already GO ourselves — AP+STA mode)
+                if (!connections.containsKey(addr) && !connectingPeers.contains(addr)) {
+                    initiateP2pConnect(addr);
                 }
+            }
+        });
+    }
+
+    private void initiateP2pConnect(String deviceAddress) {
+        connectingPeers.add(deviceAddress);
+        WifiP2pConfig config = new WifiP2pConfig();
+        config.deviceAddress    = deviceAddress;
+        config.groupOwnerIntent = 0; // prefer being STA (peer is GO)
+
+        manager.connect(channel, config, new ActionListener() {
+            @Override public void onSuccess() {
+                log("P2P connect initiated → " + deviceAddress);
+            }
+            @Override public void onFailure(int r) {
+                log("P2P connect failed → " + deviceAddress + " reason=" + r);
+                connectingPeers.remove(deviceAddress);
             }
         });
     }
@@ -158,38 +219,35 @@ public class LacWifiDirect {
     private void requestConnectionInfo() {
         manager.requestConnectionInfo(channel, info -> {
             if (info != null && info.groupFormed) {
-                groupFormed = true;
                 String  ownerIp = info.groupOwnerAddress.getHostAddress();
                 boolean isOwner = info.isGroupOwner;
-                log("group formed — ownerIp=" + ownerIp + " isOwner=" + isOwner);
+                log("P2P group formed — ownerIp=" + ownerIp + " isOwner=" + isOwner);
                 listener.onConnected(ownerIp, isOwner);
 
                 if (!isOwner) {
-                    // We are STA — connect TCP to Group Owner
+                    // We joined as STA — TCP connect to Group Owner
                     connectTcpTo(ownerIp, "go_" + ownerIp);
                 }
-                // If we ARE the Group Owner, the STA will connect to our TCP server
-            } else {
-                groupFormed = false;
+                // If we ARE the owner — STA will TCP connect to our server
             }
         });
     }
 
-    // ── TCP Server ────────────────────────────────────────────────────────────
+    // ── TCP Server (always on — accepts incoming STA connections) ─────────────
 
     private void startTcpServer() {
         executor.submit(() -> {
             try {
                 serverSocket = new ServerSocket(MESH_PORT);
-                log("TCP server listening on :" + MESH_PORT);
+                log("TCP server on :" + MESH_PORT);
                 while (running) {
                     try {
                         Socket client = serverSocket.accept();
                         String ip = client.getInetAddress().getHostAddress();
                         log("incoming TCP from " + ip);
-                        handleIncomingSocket(client, "client_" + ip);
+                        handleIncomingSocket(client, "cli_" + ip);
                     } catch (IOException e) {
-                        if (running) log("server accept error: " + e.getMessage());
+                        if (running) log("accept error: " + e.getMessage());
                     }
                 }
             } catch (IOException e) {
@@ -205,9 +263,10 @@ public class LacWifiDirect {
                 PeerConnection conn   = new PeerConnection(socket, writer, peerId);
                 synchronized (connections) { connections.put(peerId, conn); }
                 listener.onPeerFound(peerId, peerId);
-                log("TCP peer connected (incoming): " + peerId);
+                log("peer connected (in): " + peerId + " total=" + connections.size());
 
-                BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+                BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(socket.getInputStream()));
                 String line;
                 while (running && (line = reader.readLine()) != null) {
                     if (!line.isEmpty()) listener.onPacketReceived(line, peerId);
@@ -220,7 +279,7 @@ public class LacWifiDirect {
         });
     }
 
-    // ── TCP Client ────────────────────────────────────────────────────────────
+    // ── TCP Client (STA — connect to peer's GO) ───────────────────────────────
 
     private void connectTcpTo(String ip, String peerId) {
         if (connections.containsKey(peerId)) return;
@@ -228,7 +287,7 @@ public class LacWifiDirect {
             int retries = 0;
             while (running && retries < 8) {
                 try {
-                    log("TCP connecting to " + ip + ":" + MESH_PORT + " (attempt " + (retries + 1) + ")");
+                    log("TCP → " + ip + ":" + MESH_PORT + " (try " + (retries+1) + ")");
                     Socket socket = new Socket();
                     socket.connect(new InetSocketAddress(ip, MESH_PORT), 5000);
 
@@ -236,9 +295,14 @@ public class LacWifiDirect {
                     PeerConnection conn   = new PeerConnection(socket, writer, peerId);
                     synchronized (connections) { connections.put(peerId, conn); }
                     listener.onPeerFound(peerId, ip);
-                    log("TCP connected to " + ip + " ✓");
+                    log("TCP connected ✓ " + ip + " total=" + connections.size());
 
-                    BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+                    // Continue discovery — find more peers
+                    new android.os.Handler(Looper.getMainLooper())
+                        .postDelayed(() -> discoverPeers(), 2000);
+
+                    BufferedReader reader = new BufferedReader(
+                        new InputStreamReader(socket.getInputStream()));
                     String line;
                     while (running && (line = reader.readLine()) != null) {
                         if (!line.isEmpty()) listener.onPacketReceived(line, peerId);
@@ -246,13 +310,12 @@ public class LacWifiDirect {
                     break;
                 } catch (IOException e) {
                     retries++;
-                    log("TCP connect failed (" + retries + "): " + e.getMessage());
+                    log("TCP failed (" + retries + "): " + e.getMessage());
                     try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
                 }
             }
-            if (retries >= 8) {
-                log("gave up TCP to " + ip);
-            }
+            connectingPeers.remove(peerId);
+            if (retries >= 8) log("gave up TCP to " + ip);
         });
     }
 
@@ -260,7 +323,7 @@ public class LacWifiDirect {
 
     private final BroadcastReceiver receiver = new BroadcastReceiver() {
         @Override
-        public void onReceive(Context context, Intent intent) {
+        public void onReceive(Context ctx, Intent intent) {
             String action = intent.getAction();
             if (action == null) return;
             switch (action) {
@@ -268,22 +331,23 @@ public class LacWifiDirect {
                     requestPeerList();
                     break;
                 case WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION:
-                    NetworkInfo netInfo = intent.getParcelableExtra(WifiP2pManager.EXTRA_NETWORK_INFO);
-                    if (netInfo != null && netInfo.isConnected()) {
+                    NetworkInfo net = intent.getParcelableExtra(WifiP2pManager.EXTRA_NETWORK_INFO);
+                    if (net != null && net.isConnected()) {
                         requestConnectionInfo();
                     } else {
-                        groupFormed = false;
                         listener.onDisconnected();
-                        log("WiFi P2P disconnected");
-                        // Restart discovery
-                        if (running) discoverPeers();
+                        log("P2P disconnected — restarting discovery");
+                        if (running) {
+                            new android.os.Handler(Looper.getMainLooper())
+                                .postDelayed(() -> discoverPeers(), 3000);
+                        }
                     }
                     break;
                 case WifiP2pManager.WIFI_P2P_DISCOVERY_CHANGED_ACTION:
                     int state = intent.getIntExtra(WifiP2pManager.EXTRA_DISCOVERY_STATE, -1);
-                    if (state == WifiP2pManager.WIFI_P2P_DISCOVERY_STOPPED && running && !groupFormed) {
-                        log("discovery stopped — restarting");
-                        discoverPeers();
+                    if (state == WifiP2pManager.WIFI_P2P_DISCOVERY_STOPPED && running) {
+                        new android.os.Handler(Looper.getMainLooper())
+                            .postDelayed(() -> discoverPeers(), 3000);
                     }
                     break;
             }
@@ -291,11 +355,11 @@ public class LacWifiDirect {
     };
 
     private void registerReceiver() {
-        IntentFilter filter = new IntentFilter();
-        filter.addAction(WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION);
-        filter.addAction(WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION);
-        filter.addAction(WifiP2pManager.WIFI_P2P_DISCOVERY_CHANGED_ACTION);
-        context.registerReceiver(receiver, filter);
+        IntentFilter f = new IntentFilter();
+        f.addAction(WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION);
+        f.addAction(WifiP2pManager.WIFI_P2P_CONNECTION_CHANGED_ACTION);
+        f.addAction(WifiP2pManager.WIFI_P2P_DISCOVERY_CHANGED_ACTION);
+        context.registerReceiver(receiver, f);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -305,13 +369,14 @@ public class LacWifiDirect {
         if (conn != null) {
             try { conn.socket.close(); } catch (IOException ignored) {}
             listener.onPeerLost(id);
+            log("peer left: " + id + " total=" + connections.size());
         }
     }
 
     private void closeAllConnections() {
         synchronized (connections) {
-            for (PeerConnection conn : connections.values()) {
-                try { conn.socket.close(); } catch (IOException ignored) {}
+            for (PeerConnection c : connections.values()) {
+                try { c.socket.close(); } catch (IOException ignored) {}
             }
             connections.clear();
         }
