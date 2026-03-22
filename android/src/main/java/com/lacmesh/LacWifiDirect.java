@@ -131,6 +131,13 @@ public class LacWifiDirect {
 
     public int getConnectedCount() { return connections.size(); }
 
+    /** Manual connect by device address (called from JS via plugin) */
+    public void connectToPeer(String deviceAddress) {
+        if (!connections.containsKey(deviceAddress) && !connectingPeers.contains(deviceAddress)) {
+            initiateP2pConnect(deviceAddress);
+        }
+    }
+
     // ── Autonomous Group (AP+STA core) ────────────────────────────────────────
 
     /**
