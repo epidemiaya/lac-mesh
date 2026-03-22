@@ -1,3 +1,4 @@
+// v3 — autonomous group, multi-hop, 3+ devices
 package uk.lac.mesh;
 
 import android.content.BroadcastReceiver;
@@ -403,3 +404,4 @@ public class LacWifiDirect {
         }
     }
 }
+
