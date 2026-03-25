@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+  <title>LAC Mesh</title>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{background:#0a0a0a;color:#00ff88;font-family:"Courier New",monospace;padding:20px}
+    h2{font-size:20px;letter-spacing:2px;margin-bottom:16px;border-bottom:1px solid #00ff8844;padding-bottom:10px}
+    .row{margin-bottom:10px;font-size:14px}
+    #peers{color:#00ccff;font-size:22px;font-weight:bold}
+    #myid{color:#555;font-size:11px;margin-bottom:16px}
+    button{background:#00ff8822;border:1px solid #00ff88;color:#00ff88;padding:12px;
+           font-family:monospace;font-size:13px;border-radius:6px;cursor:pointer;
+           width:100%;margin-top:8px}
+    #log{margin-top:16px;font-size:11px;color:#00ff8866;line-height:1.8;
+         border-top:1px solid #00ff8811;padding-top:10px;max-height:65vh;overflow-y:auto}
+    #log div{padding:2px 0;border-bottom:1px solid #00ff8811}
+    .hi{color:#00ff88!important;font-weight:bold}
+  </style>
+</head>
+<body>
+  <h2>&#x2B21; LAC MESH</h2>
+  <div class="row" id="status">Press START</div>
+  <div class="row" id="peers">Peers: 0</div>
+  <div class="row" id="myid">My ID: —</div>
+  <button onclick="startMesh()">START WIFI DIRECT</button>
+  <button onclick="sendToAll()">SEND HELLO TO ALL PEERS</button>
+  <div id="log"></div>
+
+<script>
+const $ = id => document.getElementById(id)
+let plugin = null
+const tcpSet = new Set()  // Set замість лічильника — немає дублів
+const myId = 'node_' + Math.random().toString(36).slice(2,8)
+$('myid').textContent = 'My ID: ' + myId
+
+function log(m, hi) {
+  const d = document.createElement('div')
+  if (hi) d.className = 'hi'
+  d.textContent = '[' + new Date().toTimeString().slice(0,8) + '] ' + m
+  $('log').prepend(d)
+}
+
+function updatePeers() {
+  $('peers').textContent = 'Peers: ' + tcpSet.size
+}
+
+async function startMesh() {
+  plugin = window.Capacitor?.Plugins?.LacWifiDirect
+  if (!plugin) { log('❌ Plugin not found'); return }
+  $('status').textContent = '🟡 Starting...'
+  try { await plugin.start() }
+  catch(e) { log('❌ ' + e.message); return }
+  $('status').textContent = '🟢 WiFi Direct Active'
+  log('✅ Started')
+
+  plugin.addListener('peerFound',       d => log('📡 P2P: ' + (d.name||d.address)))
+  plugin.addListener('peerLost',        d => log('📴 P2P lost: ' + (d.address||d.peerId)))
+
+  plugin.addListener('tcpConnected',    d => {
+    tcpSet.add(d.peerId)
+    updatePeers()
+    log('✅ TCP: ' + d.peerId, true)
+  })
+
+  plugin.addListener('tcpDisconnected', d => {
+    tcpSet.delete(d.peerId)
+    updatePeers()
+    log('🔌 TCP lost: ' + d.peerId)
+  })
+
+  plugin.addListener('connected',       d => log('🔗 Group: ' + d.groupOwnerIp + ' owner=' + d.isGroupOwner))
+  plugin.addListener('disconnected',    () => log('⚠️ P2P disconnected'))
+
+  plugin.addListener('packet', d => {
+    try { const m = JSON.parse(d.data); log('📩 FROM ' + m.from + ': "' + m.text + '"', true) }
+    catch { log('📩 ' + String(d.data).slice(0,80), true) }
+  })
+
+  plugin.addListener('log', d => log('[J] ' + d.message))
+}
+
+async function sendToAll() {
+  if (!plugin) { log('⚠️ Not started'); return }
+  if (tcpSet.size === 0) { log('⚠️ No TCP peers yet'); return }
+  const msg = JSON.stringify({from: myId, text: 'hello', ts: Date.now()})
+  try { await plugin.broadcast({data: msg}); log('📤 Sent to ' + tcpSet.size + ' peers') }
+  catch(e) { log('❌ ' + e.message) }
+}
+
+window.addEventListener('load', () => {
+  if (window.Capacitor) log('✅ Capacitor ready')
+  else setTimeout(() => {
+    if (window.Capacitor) log('✅ Capacitor ready')
+    else log('❌ No Capacitor')
+  }, 800)
+})
+</script>
+</body>
+</html>
